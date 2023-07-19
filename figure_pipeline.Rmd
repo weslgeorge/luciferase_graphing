@@ -1,0 +1,186 @@
+---
+title: "Luciferace Figure Pipeline"
+author: "Wesley J George"
+date: "2023-07-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F)
+```
+
+## Getting plate reader data ready for plotting
+
+The first step is always to load in packages needed for the analysis, you will find packages that are helpful as you work, but it is generally good to add them to the start of your code so you dont lose track of them.
+
+```{r package loading, message=F}
+library(tidyr) # helps with data wrangling
+library(dplyr) # helps with data wrangling
+library(ggplot2) # needed for plotting
+library(stringr) # needed for data wrangling well string information
+library(ggpubr) # helps with plotting
+library(ggbreak) # can be useful with plotting (may remove)
+library(scales) # adds comma labels to y axis
+library(cowplot) # helps with attaching multiple plots together for bio-replicates
+library(multcompView) # needed for anova letter codes used later
+```
+
+The next step is to wrangle your data in a format that can be plotted. In the experiments I did for luciferace based assay, I took plate reader information over the course of 1.5h and use the maximum value from each well as a single data point. It's important not to use all data points from this kind of data set since at a certain point you will get significant results by just minor differences in well information by leaving longer and longer plate reading experiments going. Eventually you get significance after some amount of time so doing some quick analysis to find a mean or max or I have also seen log sum to constrain the data as one value per well is important. 
+
+Another important step is that the data as is, is a big list where every column is a well, since this is the case, we need to both assign our experimental metadata to the well information, and pivot the wells to be in a longer format, so that every value in the well table is in a single column. It sounds a bit complicated but its really not too bad
+
+```{r loading in the data}
+luc_df <- read.csv(file = "Luciferase_1h_test_data.csv") # reads in data
+
+test_df <- luc_df %>% 
+  select(colnames(luc_df[1:8]))
+head(test_df) # example of original data format, columns continue with wells
+
+# next we pivot so that there is a well column (column names) and a luminescence column (values from original columns)
+luc_long_df <- pivot_longer(luc_df, cols = colnames(luc_df)[4:99], # makes csv data into long format (easier for me to work with in ggplot)
+                                     names_to = c("well"), values_to = c("luminescence"))
+
+head(luc_long_df)
+```
+
+Now that we have the data in a long format we can assign the well information a bit easier with some dplyr functions (mutate() which assigns new columns based on conditions you specify) and stringr for the str_detect function. The stringr syntax is a bit complicated to look at but not too bad, I strongly recommend looking through the stringr cheat sheet online <https://evoldyn.gitlab.io/evomics-2018/ref-sheets/R_strings.pdf> for examples there. Essentially in the code below I am saying wells that have a 2 or 8 are assigned 35_S and so on. Then in the next mutate I am assigning which method I used for the wells in another new column. And finally I am using the next block to find the max luminecence for each well to summarize the data a bit more
+
+```{r assigning well information}
+luc_long_annotated_df <- luc_long_df %>%  # annotates well information 
+  mutate(agro_strain = case_when(str_detect(well, "(?<=[:alpha:])2|8") == T ~ "35_S",
+                              str_detect(well, "3|9") == T ~ "EV",
+                              str_detect(well, "4|10") == T ~ "line_1",
+                              str_detect(well, "5|11") == T ~ "line_2",
+                              str_detect(well, "(1(?!.)|7)") == T ~ "line_3",)) %>% 
+  mutate(application_method = case_when(str_detect(well, "7|8|9|10|11") == T ~ "rep_method_1",
+                                        str_detect(well, "(?<=[:alpha:])1|(?<=[:alpha:])2|3|4|5") == T ~ "rep_method_2")) %>% 
+  filter(is.na(luminescence) == F)
+
+head(luc_long_annotated_df)
+
+luc_long_annotated_filtered_df <- luc_long_annotated_df %>% 
+  group_by(well) %>% 
+  reframe(luminescence = max(luminescence), agro_strain,application_method) %>% # this will simplify the data frame so that it only includes max luminescence data for each well
+  distinct(well, luminescence, agro_strain, application_method) # then I get only unique rows from that re frame
+
+head(luc_long_annotated_filtered_df)
+
+# Finally lets add some factors, this will ensure when we plot things are in the order we want
+luc_long_annotated_filtered_df$agro_strain <- as.factor(luc_long_annotated_filtered_df$agro_strain)
+
+# now order the factors so col is first
+luc_long_annotated_filtered_df$agro_strain = ordered(x=luc_long_annotated_filtered_df$agro_strain, 
+                                      c('35_S','line_1','line_2','line_3','EV'))
+
+# use to check levels of your factors
+levels(luc_long_annotated_filtered_df$agro_strain)
+
+```
+
+Now we nearly have all the information we need for plotting the data without any statistical analysis!
+
+## Statistical analysis with one way anova
+
+Most of this statistical analysis and way to get it into ggplot comes from this post <https://statdoe.com/one-way-anova-and-box-plot-in-r/> so defintly go there for more information. I am using it to do a two way anova due to there being different methods used in the luciferin application. 
+
+```{r anova}
+# lets do a quick one way anova
+luc_long_annotated_filtered_no_cntrl_meth_1_df<-luc_long_annotated_filtered_df %>% 
+  group_by(well) %>%  
+  filter(!agro_strain %in% c("35_S","EV")) %>%  # remove the positive and negative controls here since they are less relevant to the differences 
+  filter(application_method == "rep_method_1")
+
+
+anova <- aov(luminescence ~ agro_strain, luc_long_annotated_filtered_no_cntrl_meth_1_df)
+summary(anova)
+turkey <- TukeyHSD(anova)
+cld<- multcompLetters4(anova, turkey)
+
+table_of_anova <- luc_long_annotated_filtered_no_cntrl_meth_1_df %>% 
+  dplyr::group_by(agro_strain) %>% 
+  summarize(mean = mean(luminescence, na.rm = T), quant = quantile(luminescence, probs = 0.75)) %>% 
+  arrange(desc(mean))
+
+cld <- as.data.frame.list(cld$agro_strain)
+table_of_anova$cld <- cld$Letters
+```
+
+Now we have codes of significance for our agro_strains based on which trial they came from. We also assigned them to be ready to place at the top of the boxplot
+
+```{r plotting the data}
+plot_1<-ggplot(data = luc_long_annotated_filtered_no_cntrl_meth_1_df,
+       mapping = aes(x=agro_strain, y = luminescence))+
+  geom_boxplot(aes(fill = agro_strain))+
+  geom_jitter(alpha = 0.2)+
+  geom_text(data = table_of_anova,
+            aes(x = agro_strain, y = quant,
+                label = cld ),
+            position = position_dodge(width = 1),
+            size = 3, vjust=-1, hjust=-1)+
+  scale_y_continuous(labels = label_comma())+
+  labs(title = "Method 1",
+       y = "Luminescence",
+       x = "Test Strain")+
+  theme_linedraw()+
+  theme(legend.position = "none")
+plot(plot_1)
+```  
+
+Unfortunately I had to filter for a single biological replicate to make this work, so we will have to do this analysis again for the other replicate 
+
+```{r anova 2}
+
+# lets do a quick one way anova
+luc_long_annotated_filtered_no_cntrl_meth_2_df<-luc_long_annotated_filtered_df %>% 
+  group_by(well) %>%  
+  filter(!agro_strain %in% c("35_S","EV")) %>%  # remove the positive and negative controls here since they are not relevant to the differences between strains, do check that they are positive and at 0 and that strains you use do not match EV especially
+  filter(application_method == "rep_method_2")
+
+
+anova <- aov(luminescence ~ agro_strain, luc_long_annotated_filtered_no_cntrl_meth_2_df) # dependant ~ independant variable format for anova test
+summary(anova) # sumarizes one way anova test
+tukey <- TukeyHSD(anova)
+cld<- multcompLetters4(anova, tukey) # generates significance letters from tukey and anova 
+
+table_of_anova <- luc_long_annotated_filtered_no_cntrl_meth_2_df %>% 
+  dplyr::group_by(agro_strain) %>% 
+  summarize(mean = mean(luminescence, na.rm = T), quant = quantile(luminescence, probs = 0.75)) %>% 
+  arrange(desc(mean)) # generates a summary table of means and the top 75% quantile of the distribution for placing text above the boxplots later. 
+
+cld <- as.data.frame.list(cld$agro_strain)
+table_of_anova$cld <- cld$Letters # adds in the cld letter significance codes to the summary table
+head(table_of_anova)
+```
+
+Now we can plot the second replicate. 
+
+```{r plotting the data 2}
+plot_2<-ggplot(data = luc_long_annotated_filtered_no_cntrl_meth_2_df,
+       mapping = aes(x=agro_strain, y = luminescence))+
+  geom_boxplot(aes(fill = agro_strain))+
+  geom_jitter(alpha = 0.2)+
+  geom_text(data = table_of_anova,
+            aes(x = agro_strain, y = quant,
+                label = cld ),
+            position = position_dodge(width = 1),
+            size = 3, vjust=-1, hjust=-1)+ # adds in the significance tags we generated above
+  scale_y_continuous(labels = label_comma())+
+  labs(title = "Method 2",
+       y = "Luminescence",
+       x = "Test Strain")+
+  theme_linedraw()+
+  theme(legend.position = "none")
+plot(plot_2)
+```
+
+Now that we have the two plots we can combine them with plot_grid()
+
+```{r plot combining}
+grid_plot <-plot_grid(plot_1,plot_2, align = "h")
+plot(grid_plot)
+```
+
+We can see that there are differences in the scale for both methods, though the trend holds in both. You can play around with deleting the labs in the right plot to not have redundant labels, and normally I try to clean plots up in inkscape prior to adding them to posters or manuscripts, but this gives a relativly good base to start to do that with! 
+
+Hope this helps with a one way anova example and 
+
